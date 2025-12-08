@@ -8,7 +8,7 @@ Cards are imported from standard Anki `.apkg` export files into a local database
 
 ## Where to put `.apkg` files
 
-Anki Viewer looks for Anki packages in a dedicated **shared** folder inside KOReaders data directory:
+Anki Viewer looks for Anki packages in a dedicated **shared** folder inside KOReader's data directory:
 
 ```text
 <KOReader data directory>/ankiviewer/shared
@@ -43,7 +43,7 @@ If the `ankiviewer` or `shared` folders do not exist, the plugin will create the
    You can also download many ready-made shared decks from AnkiWeb: https://ankiweb.net/shared/decks
 
 2. **Open the plugin**  
-   - In KOReaders main menu, open **Tools  Anki Viewer** (or the equivalent entry for this plugin).
+   - In KOReader's main menu, open **Tools > Anki Viewer** (or the equivalent entry for this plugin).
 
 3. **Import a deck**  
    - From the study screen, tap **Import**.  
@@ -60,7 +60,7 @@ If the `ankiviewer` or `shared` folders do not exist, the plugin will create the
    - Tap **Show answer** to reveal the back of the card.  
    - Rate the card (**Again / Hard / Good / Easy**) to schedule future reviews.
 
-Imported decks and review progress are stored in KOReaders data directory; removing the original `.apkg` file from `ankiviewer/shared` does **not** delete the already-imported deck.
+Imported decks and review progress are stored in KOReader's data directory; removing the original `.apkg` file from `ankiviewer/shared` does **not** delete the already-imported deck.
 
 ## Notes and limitations
 
