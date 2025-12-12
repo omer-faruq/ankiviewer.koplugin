@@ -28,6 +28,8 @@ local _ = require("gettext")
 local AnkiDB = require("ankiviewer_db")
 local AnkiApkgImport = require("ankiviewer_apkg_import")
 
+local VERTICAL_SPAN_SMALL = rawget(Size.span, "vertical_small") or rawget(Size.span, "vertical_default") or rawget(Size.span, "vertical_large") or 0
+
 local AnkiViewerScreen = InputContainer:extend{}
 local AnkiViewerStudyScreen = InputContainer:extend{}
 local AnkiViewer = WidgetContainer:extend{
@@ -213,9 +215,9 @@ function AnkiViewerScreen:init()
         padding = Size.padding.large,
         margin = Size.margin.default,
         title,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         info,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         button_row,
     }
 
@@ -468,7 +470,7 @@ function AnkiViewerStudyScreen:init()
     local top_bar = VerticalGroup:new{
         align = "center",
         top_controls,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         self.title_widget,
     }
 
@@ -555,25 +557,25 @@ function AnkiViewerStudyScreen:init()
     local col_again = VerticalGroup:new{
         align = "center",
         self.interval_again,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         self.again_button,
     }
     local col_hard = VerticalGroup:new{
         align = "center",
         self.interval_hard,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         self.hard_button,
     }
     local col_good = VerticalGroup:new{
         align = "center",
         self.interval_good,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         self.good_button,
     }
     local col_easy = VerticalGroup:new{
         align = "center",
         self.interval_easy,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         self.easy_button,
     }
 
@@ -591,24 +593,24 @@ function AnkiViewerStudyScreen:init()
     -- Separate layouts for front (question) and back (answer + ratings)
     self.front_layout = VerticalGroup:new{
         align = "center",
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         top_bar,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         self.card_frame,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         show_row,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
     }
 
     self.back_layout = VerticalGroup:new{
         align = "center",
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         top_bar,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         self.card_frame,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         rating_row,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
     }
 
     self.active_layout = self.front_layout
@@ -1254,7 +1256,7 @@ function AnkiViewer:showApkgFieldMappingDialog(file, inspect_info, existing_mapp
             end
         end
 
-        table.insert(content_group, VerticalSpan:new{ width = Size.span.vertical_small })
+        table.insert(content_group, VerticalSpan:new{ width = VERTICAL_SPAN_SMALL })
         model_state[primary_mid] = state_for_model
     end
 
@@ -1329,13 +1331,13 @@ function AnkiViewer:showApkgFieldMappingDialog(file, inspect_info, existing_mapp
     local layout = VerticalGroup:new{
         align = "left",
         title,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         subtitle,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         description,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         content_group,
-        VerticalSpan:new{ width = Size.span.vertical_small },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         buttons_row,
     }
 
