@@ -29,6 +29,7 @@ local SCHEMA_STATEMENTS = {
         updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
     )]],
     [[CREATE INDEX IF NOT EXISTS idx_cards_deck ON cards(deck_id)]],
+    [[CREATE INDEX IF NOT EXISTS idx_cards_deck_due ON cards(deck_id, due)]],
     [[CREATE TABLE IF NOT EXISTS source_notes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         deck_id INTEGER NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
@@ -409,19 +410,50 @@ local function formatDelta(delta)
     return tostring(days) .. "d"
 end
 
-function DB.fetchNextDueCard(deck_id, now_ts)
+function DB.fetchNextDueCard(deck_id, now_ts, randomize_equal_due)
     DB.init()
     if not deck_id then
         return nil
     end
     local now = now_ts or os.time()
     return withConnection(function(conn)
-        local stmt = conn:prepare([[SELECT id, deck_id, front, back, ease, interval, due, reps, lapses
-            FROM cards
-            WHERE deck_id = ? AND due <= ?
-            ORDER BY due ASC
-            LIMIT 1;]])
-        stmt:bind(deck_id, now)
+        randomize_equal_due = not not randomize_equal_due
+        local stmt
+        if randomize_equal_due then
+            stmt = conn:prepare([[WITH mindue AS (
+                    SELECT MIN(due) AS due
+                    FROM cards
+                    WHERE deck_id = ? AND due <= ?
+                ), candidates AS (
+                    SELECT id
+                    FROM cards
+                    WHERE deck_id = ? AND due = (SELECT due FROM mindue)
+                ), stats AS (
+                    SELECT COUNT(*) AS cnt FROM candidates
+                ), picked AS (
+                    SELECT id
+                    FROM candidates
+                    LIMIT 1
+                    OFFSET (
+                        CASE
+                            WHEN (SELECT cnt FROM stats) <= 1 THEN 0
+                            ELSE (abs(random()) % (SELECT cnt FROM stats))
+                        END
+                    )
+                )
+                SELECT id, deck_id, front, back, ease, interval, due, reps, lapses
+                FROM cards
+                WHERE id = (SELECT id FROM picked)
+                LIMIT 1;]])
+            stmt:bind(deck_id, now, deck_id)
+        else
+            stmt = conn:prepare([[SELECT id, deck_id, front, back, ease, interval, due, reps, lapses
+                FROM cards
+                WHERE deck_id = ? AND due <= ?
+                ORDER BY due ASC
+                LIMIT 1;]])
+            stmt:bind(deck_id, now)
+        end
         local rows = stmt:resultset("hik")
         stmt:close()
         if not rows or not rows[1] or #rows[1] == 0 then

@@ -414,9 +414,7 @@ function AnkiViewerStudyScreen:init()
     self.settings_button = Button:new{
         text = _("Settings"),
         callback = function()
-            if self.plugin and self.plugin.openCurrentDeckFieldMapping then
-                self.plugin:openCurrentDeckFieldMapping(self)
-            end
+            self:showSettingsMenu()
         end,
         text_font_face = "cfont",
         text_font_size = 24,
@@ -651,7 +649,11 @@ function AnkiViewerStudyScreen:setShowButtonVisible(visible)
 end
 
 function AnkiViewerStudyScreen:loadNextCard()
-    local card = AnkiDB.fetchNextDueCard(self.deck_id)
+    local randomize_equal_due = false
+    if self.settings then
+        randomize_equal_due = not not self.settings:readSetting("randomize_equal_due")
+    end
+    local card = AnkiDB.fetchNextDueCard(self.deck_id, nil, randomize_equal_due)
     if not card then
         self.current_card = nil
         self.showing_back = false
@@ -699,6 +701,86 @@ function AnkiViewerStudyScreen:onRate(rating)
     self.current_card = updated or self.current_card
     self.showing_back = false
     self:loadNextCard()
+end
+
+function AnkiViewerStudyScreen:showSettingsMenu()
+    local study = self
+    local screen = Device.screen
+    local menu
+
+    local items = {
+        {
+            text = _("Randomize cards with same due"),
+            keep_menu_open = true,
+            mandatory_func = function()
+                if not study.settings then
+                    return "OFF"
+                end
+                if study.settings:readSetting("randomize_equal_due") then
+                    return "ON"
+                end
+                return "OFF"
+            end,
+            checked_func = function()
+                if not study.settings then
+                    return false
+                end
+                return not not study.settings:readSetting("randomize_equal_due")
+            end,
+            callback = function()
+                if not study.settings then
+                    return
+                end
+                local current = not not study.settings:readSetting("randomize_equal_due")
+                study.settings:saveSetting("randomize_equal_due", not current)
+                study.settings:flush()
+                if menu and menu.updateItems then
+                    menu:updateItems(1, true)
+                end
+            end,
+        },
+        {
+            text = _("Field mapping"),
+            keep_menu_open = false,
+            callback = function()
+                if menu then
+                    UIManager:close(menu)
+                end
+                if study.plugin and study.plugin.openCurrentDeckFieldMapping then
+                    study.plugin:openCurrentDeckFieldMapping(study)
+                end
+            end,
+        },
+        {
+            text = _("Close"),
+            keep_menu_open = false,
+            callback = function()
+                if menu then
+                    UIManager:close(menu)
+                end
+            end,
+        },
+    }
+
+    menu = Menu:new{
+        title = _("Settings"),
+        item_table = items,
+        covers_fullscreen = true,
+        width = math.floor(screen:getWidth() * 0.9),
+        height = math.floor(screen:getHeight() * 0.9),
+    }
+
+    function menu:onMenuChoice(item)
+        if item.callback then
+            item.callback()
+        end
+        if not item.keep_menu_open then
+            UIManager:close(self)
+        end
+        return true
+    end
+
+    UIManager:show(menu)
 end
 
 function AnkiViewerStudyScreen:applyDeckSelection(deck)
