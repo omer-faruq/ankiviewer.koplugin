@@ -3,5 +3,5 @@ return {
     name = "ankiviewer",
     fullname = _("Anki Viewer"),
     description = _([[Study Anki flashcards in KOReader using locally imported .apkg decks]]),
-    version = "1.0.1",
+    version = "1.1.0",
 }
