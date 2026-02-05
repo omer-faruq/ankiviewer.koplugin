@@ -6,7 +6,7 @@ local logger = require("logger")
 
 local DB = {}
 
-local DB_SCHEMA_VERSION = 3
+local DB_SCHEMA_VERSION = 4
 local DB_DIRECTORY = ffiUtil.joinPath(DataStorage:getDataDir(), "ankiviewer")
 local DB_PATH = ffiUtil.joinPath(DB_DIRECTORY, "ankiviewer.sqlite3")
 
@@ -37,6 +37,14 @@ local SCHEMA_STATEMENTS = {
         flds TEXT NOT NULL
     )]],
     [[CREATE INDEX IF NOT EXISTS idx_source_notes_deck ON source_notes(deck_id)]],
+    [[CREATE TABLE IF NOT EXISTS daily_new_cards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        deck_id INTEGER NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
+        date TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(deck_id, date)
+    )]],
+    [[CREATE INDEX IF NOT EXISTS idx_daily_new_cards_deck_date ON daily_new_cards(deck_id, date)]],
 }
 
 local initialized = false
@@ -410,7 +418,44 @@ local function formatDelta(delta)
     return tostring(days) .. "d"
 end
 
-function DB.fetchNextDueCard(deck_id, now_ts, randomize_equal_due)
+local function getTodayDateString()
+    return os.date("%Y-%m-%d", os.time())
+end
+
+function DB.getDailyNewCardsCount(deck_id)
+    DB.init()
+    if not deck_id then
+        return 0
+    end
+    local today = getTodayDateString()
+    return withConnection(function(conn)
+        local stmt = conn:prepare([[SELECT count FROM daily_new_cards WHERE deck_id = ? AND date = ?;]])
+        stmt:bind(deck_id, today)
+        local count_str = stmt:step()
+        stmt:close()
+        if count_str and count_str[1] then
+            return tonumber(count_str[1]) or 0
+        end
+        return 0
+    end)
+end
+
+function DB.incrementDailyNewCardsCount(deck_id)
+    DB.init()
+    if not deck_id then
+        return
+    end
+    local today = getTodayDateString()
+    withConnection(function(conn)
+        local stmt = conn:prepare([[INSERT INTO daily_new_cards (deck_id, date, count) VALUES (?, ?, 1)
+            ON CONFLICT(deck_id, date) DO UPDATE SET count = count + 1;]])
+        stmt:bind(deck_id, today)
+        stmt:step()
+        stmt:close()
+    end)
+end
+
+function DB.fetchNextDueCard(deck_id, now_ts, randomize_equal_due, daily_new_limit)
     DB.init()
     if not deck_id then
         return nil
@@ -418,41 +463,93 @@ function DB.fetchNextDueCard(deck_id, now_ts, randomize_equal_due)
     local now = now_ts or os.time()
     return withConnection(function(conn)
         randomize_equal_due = not not randomize_equal_due
+        local new_limit = tonumber(daily_new_limit) or 0
+        local today_new_count = 0
+        
+        if new_limit > 0 then
+            local today = getTodayDateString()
+            local count_stmt = conn:prepare([[SELECT count FROM daily_new_cards WHERE deck_id = ? AND date = ?;]])
+            count_stmt:bind(deck_id, today)
+            local count_row = count_stmt:step()
+            count_stmt:close()
+            if count_row and count_row[1] then
+                today_new_count = tonumber(count_row[1]) or 0
+            end
+        end
+        
         local stmt
         if randomize_equal_due then
-            stmt = conn:prepare([[WITH mindue AS (
-                    SELECT MIN(due) AS due
+            if new_limit > 0 and today_new_count >= new_limit then
+                stmt = conn:prepare([[WITH mindue AS (
+                        SELECT MIN(due) AS due
+                        FROM cards
+                        WHERE deck_id = ? AND due <= ? AND NOT (reps = 0 AND interval = 0)
+                    ), candidates AS (
+                        SELECT id
+                        FROM cards
+                        WHERE deck_id = ? AND due = (SELECT due FROM mindue) AND NOT (reps = 0 AND interval = 0)
+                    ), stats AS (
+                        SELECT COUNT(*) AS cnt FROM candidates
+                    ), picked AS (
+                        SELECT id
+                        FROM candidates
+                        LIMIT 1
+                        OFFSET (
+                            CASE
+                                WHEN (SELECT cnt FROM stats) <= 1 THEN 0
+                                ELSE (abs(random()) % (SELECT cnt FROM stats))
+                            END
+                        )
+                    )
+                    SELECT id, deck_id, front, back, ease, interval, due, reps, lapses
+                    FROM cards
+                    WHERE id = (SELECT id FROM picked)
+                    LIMIT 1;]])
+                stmt:bind(deck_id, now, deck_id)
+            else
+                stmt = conn:prepare([[WITH mindue AS (
+                        SELECT MIN(due) AS due
+                        FROM cards
+                        WHERE deck_id = ? AND due <= ?
+                    ), candidates AS (
+                        SELECT id
+                        FROM cards
+                        WHERE deck_id = ? AND due = (SELECT due FROM mindue)
+                    ), stats AS (
+                        SELECT COUNT(*) AS cnt FROM candidates
+                    ), picked AS (
+                        SELECT id
+                        FROM candidates
+                        LIMIT 1
+                        OFFSET (
+                            CASE
+                                WHEN (SELECT cnt FROM stats) <= 1 THEN 0
+                                ELSE (abs(random()) % (SELECT cnt FROM stats))
+                            END
+                        )
+                    )
+                    SELECT id, deck_id, front, back, ease, interval, due, reps, lapses
+                    FROM cards
+                    WHERE id = (SELECT id FROM picked)
+                    LIMIT 1;]])
+                stmt:bind(deck_id, now, deck_id)
+            end
+        else
+            if new_limit > 0 and today_new_count >= new_limit then
+                stmt = conn:prepare([[SELECT id, deck_id, front, back, ease, interval, due, reps, lapses
+                    FROM cards
+                    WHERE deck_id = ? AND due <= ? AND NOT (reps = 0 AND interval = 0)
+                    ORDER BY due ASC
+                    LIMIT 1;]])
+                stmt:bind(deck_id, now)
+            else
+                stmt = conn:prepare([[SELECT id, deck_id, front, back, ease, interval, due, reps, lapses
                     FROM cards
                     WHERE deck_id = ? AND due <= ?
-                ), candidates AS (
-                    SELECT id
-                    FROM cards
-                    WHERE deck_id = ? AND due = (SELECT due FROM mindue)
-                ), stats AS (
-                    SELECT COUNT(*) AS cnt FROM candidates
-                ), picked AS (
-                    SELECT id
-                    FROM candidates
-                    LIMIT 1
-                    OFFSET (
-                        CASE
-                            WHEN (SELECT cnt FROM stats) <= 1 THEN 0
-                            ELSE (abs(random()) % (SELECT cnt FROM stats))
-                        END
-                    )
-                )
-                SELECT id, deck_id, front, back, ease, interval, due, reps, lapses
-                FROM cards
-                WHERE id = (SELECT id FROM picked)
-                LIMIT 1;]])
-            stmt:bind(deck_id, now, deck_id)
-        else
-            stmt = conn:prepare([[SELECT id, deck_id, front, back, ease, interval, due, reps, lapses
-                FROM cards
-                WHERE deck_id = ? AND due <= ?
-                ORDER BY due ASC
-                LIMIT 1;]])
-            stmt:bind(deck_id, now)
+                    ORDER BY due ASC
+                    LIMIT 1;]])
+                stmt:bind(deck_id, now)
+            end
         end
         local rows = stmt:resultset("hik")
         stmt:close()

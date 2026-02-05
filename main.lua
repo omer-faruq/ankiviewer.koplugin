@@ -25,6 +25,8 @@ local LuaSettings = require("luasettings")
 local CheckButton = require("ui/widget/checkbutton")
 local ScrollableContainer = require("ui/widget/container/scrollablecontainer")
 local _ = require("gettext")
+local logger = require("logger")
+local DataStorage = require("datastorage")
 local AnkiDB = require("ankiviewer_db")
 local AnkiApkgImport = require("ankiviewer_apkg_import")
 
@@ -294,12 +296,10 @@ function AnkiViewerStudyScreen:init()
         self.key_events.Close = { { Device.input.group.Back } }
     end
 
-    self.settings = LuaSettings:open("ankiviewer.settings")
-
     local default_id = AnkiDB.ensureSampleData()
     -- last_deck_id may have been stored as string; coerce to number so it
     -- matches numeric deck IDs returned by AnkiDB.listDecks().
-    local last_id = tonumber(self.settings:readSetting("last_deck_id"))
+    local last_id = tonumber(self.plugin:readSetting("last_deck_id"))
     local decks = AnkiDB.listDecks()
     local selected_id = nil
     local selected_name = _("Default deck")
@@ -650,10 +650,12 @@ end
 
 function AnkiViewerStudyScreen:loadNextCard()
     local randomize_equal_due = false
-    if self.settings then
-        randomize_equal_due = not not self.settings:readSetting("randomize_equal_due")
+    local daily_new_limit = 20
+    if self.plugin then
+        randomize_equal_due = not not self.plugin:readSetting("randomize_equal_due", false)
+        daily_new_limit = tonumber(self.plugin:readSetting("daily_new_cards_limit", 20)) or 20
     end
-    local card = AnkiDB.fetchNextDueCard(self.deck_id, nil, randomize_equal_due)
+    local card = AnkiDB.fetchNextDueCard(self.deck_id, nil, randomize_equal_due, daily_new_limit)
     if not card then
         self.current_card = nil
         self.showing_back = false
@@ -697,7 +699,11 @@ function AnkiViewerStudyScreen:onRate(rating)
     if not self.current_card then
         return
     end
+    local is_new_card = (self.current_card.reps == 0 and self.current_card.interval == 0)
     local updated = AnkiDB.updateCardScheduling(self.current_card, rating)
+    if is_new_card and self.deck_id then
+        AnkiDB.incrementDailyNewCardsCount(self.deck_id)
+    end
     self.current_card = updated or self.current_card
     self.showing_back = false
     self:loadNextCard()
@@ -713,30 +719,83 @@ function AnkiViewerStudyScreen:showSettingsMenu()
             text = _("Randomize cards with same due"),
             keep_menu_open = true,
             mandatory_func = function()
-                if not study.settings then
+                if not study.plugin then
                     return "OFF"
                 end
-                if study.settings:readSetting("randomize_equal_due") then
+                if study.plugin:readSetting("randomize_equal_due", false) then
                     return "ON"
                 end
                 return "OFF"
             end,
             checked_func = function()
-                if not study.settings then
+                if not study.plugin then
                     return false
                 end
-                return not not study.settings:readSetting("randomize_equal_due")
+                return not not study.plugin:readSetting("randomize_equal_due", false)
             end,
             callback = function()
-                if not study.settings then
+                if not study.plugin then
                     return
                 end
-                local current = not not study.settings:readSetting("randomize_equal_due")
-                study.settings:saveSetting("randomize_equal_due", not current)
-                study.settings:flush()
+                local current = not not study.plugin:readSetting("randomize_equal_due", false)
+                study.plugin:saveSetting("randomize_equal_due", not current)
                 if menu and menu.updateItems then
                     menu:updateItems(1, true)
                 end
+            end,
+        },
+        {
+            text = _("Daily new cards limit"),
+            keep_menu_open = true,
+            mandatory_func = function()
+                if not study.plugin then
+                    return "20"
+                end
+                local limit = tonumber(study.plugin:readSetting("daily_new_cards_limit", 20))
+                if limit == 0 then
+                    return _("Unlimited")
+                end
+                return tostring(limit)
+            end,
+            callback = function()
+                if not study.plugin then
+                    return
+                end
+                local current_limit = tonumber(study.plugin:readSetting("daily_new_cards_limit", 20))
+                local input_dialog
+                input_dialog = InputDialog:new{
+                    title = _("Daily new cards limit"),
+                    input = tostring(current_limit),
+                    input_type = "number",
+                    description = _("Set the maximum number of new cards to show per day. Set to 0 for unlimited."),
+                    buttons = {
+                        {
+                            {
+                                text = _("Cancel"),
+                                callback = function()
+                                    UIManager:close(input_dialog)
+                                end,
+                            },
+                            {
+                                text = _("Save"),
+                                is_enter_default = true,
+                                callback = function()
+                                    local new_limit = tonumber(input_dialog:getInputText()) or 20
+                                    if new_limit < 0 then
+                                        new_limit = 0
+                                    end
+                                    study.plugin:saveSetting("daily_new_cards_limit", new_limit)
+                                    UIManager:close(input_dialog)
+                                    if menu and menu.updateItems then
+                                        menu:updateItems(2, true)
+                                    end
+                                end,
+                            },
+                        },
+                    },
+                }
+                UIManager:show(input_dialog)
+                input_dialog:onShowKeyboard()
             end,
         },
         {
@@ -793,9 +852,8 @@ function AnkiViewerStudyScreen:applyDeckSelection(deck)
     if self.title_widget and self.title_widget.setText then
         self.title_widget:setText(self.deck_title)
     end
-    if self.settings then
-        self.settings:saveSetting("last_deck_id", self.deck_id)
-        self.settings:flush()
+    if self.plugin then
+        self.plugin:saveSetting("last_deck_id", self.deck_id)
     end
     self.current_card = nil
     self.showing_back = false
@@ -1501,6 +1559,30 @@ end
 
 function AnkiViewer:init()
     self.ui.menu:registerToMainMenu(self)
+end
+
+function AnkiViewer:ensureSettings()
+    if not self.settings_file then
+        self.settings_file = DataStorage:getSettingsDir() .. "/ankiviewer.lua"
+    end
+    if not self.settings then
+        self.settings = LuaSettings:open(self.settings_file)
+    end
+end
+
+function AnkiViewer:readSetting(key, default)
+    self:ensureSettings()
+    local value = self.settings:readSetting(key)
+    if value == nil then
+        return default
+    end
+    return value
+end
+
+function AnkiViewer:saveSetting(key, value)
+    self:ensureSettings()
+    self.settings:saveSetting(key, value)
+    self.settings:flush()
 end
 
 function AnkiViewer:addToMainMenu(menu_items)
