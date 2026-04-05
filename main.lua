@@ -24,6 +24,7 @@ local NetworkMgr = require("ui/network/manager")
 local LuaSettings = require("luasettings")
 local CheckButton = require("ui/widget/checkbutton")
 local ScrollableContainer = require("ui/widget/container/scrollablecontainer")
+local GestureRange = require("ui/gesturerange")
 local _ = require("gettext")
 local logger = require("logger")
 local DataStorage = require("datastorage")
@@ -331,8 +332,24 @@ function AnkiViewerStudyScreen:init()
     self.current_card = nil
     self.showing_back = false
 
-    local card_width = math.floor(Screen:getWidth() * 0.85)
-    local card_height = Size.item.height_large * 8
+    local fullscreen_mode = false
+    if self.plugin then
+        fullscreen_mode = not not self.plugin:readSetting("fullscreen_study", false)
+    end
+
+    local card_width, card_height
+    local top_bottom_spacing
+    local frame_extras = Size.padding.fullscreen + Size.margin.default + Size.border.window
+    if fullscreen_mode then
+        card_width = Screen:getWidth() - (frame_extras * 2)
+        top_bottom_spacing = Size.padding.small
+        card_height = Screen:getHeight() - Size.item.height_large * 3.5 - (top_bottom_spacing * 2) - (frame_extras * 2)
+    else
+        card_width = math.floor(Screen:getWidth() * 0.85)
+        card_height = Size.item.height_large * 8
+        top_bottom_spacing = VERTICAL_SPAN_SMALL
+    end
+    self.fullscreen_top_bottom_spacing = top_bottom_spacing
 
     local title_max_width = math.floor(Screen:getWidth() * 0.9)
     local title_face = Font:getFace("cfont", 26)
@@ -376,13 +393,30 @@ function AnkiViewerStudyScreen:init()
     }
 
     -- Card frame to visually emphasize question/answer
-    self.card_frame = FrameContainer:new{
+    local card_frame_inner = FrameContainer:new{
         padding = Size.padding.fullscreen,
         margin = Size.margin.default,
         radius = Size.radius.window,
         bordersize = Size.border.window,
         self.card_container,
     }
+    local frame_total_width = card_width + (frame_extras * 2)
+    local frame_total_height = card_height + (frame_extras * 2)
+    self.card_frame = InputContainer:new{
+        card_frame_inner,
+        dimen = Geom:new{ w = frame_total_width, h = frame_total_height },
+    }
+    if Device:isTouchDevice() then
+        self.card_frame.ges_events = {
+            Tap = {
+                GestureRange:new{
+                    ges = "tap",
+                    range = function() return self.card_frame.dimen end,
+                },
+            },
+        }
+        self.card_frame.onTap = function() self:showFullText() end
+    end
 
     -- Top controls row: Settings | Close, with deck title below
     self.close_button = Button:new{
@@ -511,71 +545,147 @@ function AnkiViewerStudyScreen:init()
     }
 
     -- Rating buttons, one column per rating (interval label above, button below)
+    local btn_width = math.floor(Screen:getWidth() * 0.18)
+    self.delete_button = Button:new{
+        text = _("Delete"),
+        callback = function() self:onDeleteCard() end,
+        width = btn_width, bordersize = 0, margin = 0, radius = 0,
+    }
     self.again_button = Button:new{
         text = _("Again"),
-        callback = function()
-            self:onRate("again")
-        end,
-        width = math.floor(Screen:getWidth() * 0.18),
-        bordersize = 0,
-        margin = 0,
-        radius = 0,
+        callback = function() self:onRate("again") end,
+        width = btn_width, bordersize = 0, margin = 0, radius = 0,
     }
     self.hard_button = Button:new{
         text = _("Hard"),
-        callback = function()
-            self:onRate("hard")
-        end,
-        width = math.floor(Screen:getWidth() * 0.18),
-        bordersize = 0,
-        margin = 0,
-        radius = 0,
+        callback = function() self:onRate("hard") end,
+        width = btn_width, bordersize = 0, margin = 0, radius = 0,
     }
     self.good_button = Button:new{
         text = _("Good"),
-        callback = function()
-            self:onRate("good")
-        end,
-        width = math.floor(Screen:getWidth() * 0.18),
-        bordersize = 0,
-        margin = 0,
-        radius = 0,
+        callback = function() self:onRate("good") end,
+        width = btn_width, bordersize = 0, margin = 0, radius = 0,
     }
     self.easy_button = Button:new{
         text = _("Easy"),
-        callback = function()
-            self:onRate("easy")
-        end,
-        width = math.floor(Screen:getWidth() * 0.18),
-        bordersize = 0,
-        margin = 0,
-        radius = 0,
+        callback = function() self:onRate("easy") end,
+        width = btn_width, bordersize = 0, margin = 0, radius = 0,
     }
 
-    local col_again = VerticalGroup:new{
+    local col_delete_inner = VerticalGroup:new{
         align = "center",
-        self.interval_again,
+        CenterContainer:new{
+            dimen = Geom:new{ w = btn_width, h = small_interval_face.size },
+            TextWidget:new{ face = small_interval_face, text = "" },
+        },
+        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
+        self.delete_button,
+    }
+    local col_delete = InputContainer:new{
+        col_delete_inner,
+        dimen = Geom:new{ w = btn_width, h = col_delete_inner:getSize().h },
+    }
+    col_delete.ges_events = {
+        Tap = {
+            GestureRange:new{
+                ges = "tap",
+                range = function() return col_delete.dimen end,
+            },
+        },
+    }
+    col_delete.onTap = function() self:onDeleteCard() end
+
+    local col_again_inner = VerticalGroup:new{
+        align = "center",
+        CenterContainer:new{
+            dimen = Geom:new{ w = btn_width, h = small_interval_face.size },
+            self.interval_again,
+        },
         VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         self.again_button,
     }
-    local col_hard = VerticalGroup:new{
+    local col_again = InputContainer:new{
+        col_again_inner,
+        dimen = Geom:new{ w = btn_width, h = col_again_inner:getSize().h },
+    }
+    col_again.ges_events = {
+        Tap = {
+            GestureRange:new{
+                ges = "tap",
+                range = function() return col_again.dimen end,
+            },
+        },
+    }
+    col_again.onTap = function() self:onRate("again") end
+
+    local col_hard_inner = VerticalGroup:new{
         align = "center",
-        self.interval_hard,
+        CenterContainer:new{
+            dimen = Geom:new{ w = btn_width, h = small_interval_face.size },
+            self.interval_hard,
+        },
         VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         self.hard_button,
     }
-    local col_good = VerticalGroup:new{
+    local col_hard = InputContainer:new{
+        col_hard_inner,
+        dimen = Geom:new{ w = btn_width, h = col_hard_inner:getSize().h },
+    }
+    col_hard.ges_events = {
+        Tap = {
+            GestureRange:new{
+                ges = "tap",
+                range = function() return col_hard.dimen end,
+            },
+        },
+    }
+    col_hard.onTap = function() self:onRate("hard") end
+
+    local col_good_inner = VerticalGroup:new{
         align = "center",
-        self.interval_good,
+        CenterContainer:new{
+            dimen = Geom:new{ w = btn_width, h = small_interval_face.size },
+            self.interval_good,
+        },
         VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         self.good_button,
     }
-    local col_easy = VerticalGroup:new{
+    local col_good = InputContainer:new{
+        col_good_inner,
+        dimen = Geom:new{ w = btn_width, h = col_good_inner:getSize().h },
+    }
+    col_good.ges_events = {
+        Tap = {
+            GestureRange:new{
+                ges = "tap",
+                range = function() return col_good.dimen end,
+            },
+        },
+    }
+    col_good.onTap = function() self:onRate("good") end
+
+    local col_easy_inner = VerticalGroup:new{
         align = "center",
-        self.interval_easy,
+        CenterContainer:new{
+            dimen = Geom:new{ w = btn_width, h = small_interval_face.size },
+            self.interval_easy,
+        },
         VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         self.easy_button,
     }
+    local col_easy = InputContainer:new{
+        col_easy_inner,
+        dimen = Geom:new{ w = btn_width, h = col_easy_inner:getSize().h },
+    }
+    col_easy.ges_events = {
+        Tap = {
+            GestureRange:new{
+                ges = "tap",
+                range = function() return col_easy.dimen end,
+            },
+        },
+    }
+    col_easy.onTap = function() self:onRate("easy") end
 
     local rating_row = HorizontalGroup:new{
         align = "center",
@@ -586,29 +696,31 @@ function AnkiViewerStudyScreen:init()
         col_good,
         HorizontalSpan:new{ width = Size.span.horizontal_small },
         col_easy,
+        HorizontalSpan:new{ width = Size.span.horizontal_small },
+        col_delete,
     }
 
     -- Separate layouts for front (question) and back (answer + ratings)
     self.front_layout = VerticalGroup:new{
         align = "center",
-        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
+        VerticalSpan:new{ width = self.fullscreen_top_bottom_spacing },
         top_bar,
         VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         self.card_frame,
         VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         show_row,
-        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
+        VerticalSpan:new{ width = self.fullscreen_top_bottom_spacing },
     }
 
     self.back_layout = VerticalGroup:new{
         align = "center",
-        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
+        VerticalSpan:new{ width = self.fullscreen_top_bottom_spacing },
         top_bar,
         VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         self.card_frame,
         VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
         rating_row,
-        VerticalSpan:new{ width = VERTICAL_SPAN_SMALL },
+        VerticalSpan:new{ width = self.fullscreen_top_bottom_spacing },
     }
 
     self.active_layout = self.front_layout
@@ -659,6 +771,7 @@ function AnkiViewerStudyScreen:loadNextCard()
     if not card then
         self.current_card = nil
         self.showing_back = false
+        self.card_full_text = nil
         self.card_widget:setText(_("No cards due."))
         self:setShowButtonVisible(false)
         self:setRatingButtonsEnabled(false)
@@ -669,6 +782,7 @@ function AnkiViewerStudyScreen:loadNextCard()
     end
     self.current_card = card
     self.showing_back = false
+    self.card_full_text = card.front
     self.card_widget:setText(card.front)
     self:setShowButtonVisible(true)
     self:setRatingButtonsEnabled(false)
@@ -684,8 +798,10 @@ function AnkiViewerStudyScreen:onShowOrNext()
     end
     if not self.showing_back then
         self.showing_back = true
+        self.card_full_text = self.current_card.back
         self.card_widget:setText(self.current_card.back)
-        local previews = AnkiDB.previewIntervals(self.current_card)
+        local min_interval_days = self.plugin and tonumber(self.plugin:readSetting("min_interval_days", 0)) or 0
+        local previews = AnkiDB.previewIntervals(self.current_card, nil, min_interval_days)
         self:updateRatingLabels(previews)
         self:setShowButtonVisible(false)
         self:setRatingButtonsEnabled(true)
@@ -699,14 +815,45 @@ function AnkiViewerStudyScreen:onRate(rating)
     if not self.current_card then
         return
     end
+    local min_interval_days = self.plugin and tonumber(self.plugin:readSetting("min_interval_days", 0)) or 0
     local is_new_card = (self.current_card.reps == 0 and self.current_card.interval == 0)
-    local updated = AnkiDB.updateCardScheduling(self.current_card, rating)
+    local updated = AnkiDB.updateCardScheduling(self.current_card, rating, nil, min_interval_days)
     if is_new_card and self.deck_id then
         AnkiDB.incrementDailyNewCardsCount(self.deck_id)
     end
     self.current_card = updated or self.current_card
     self.showing_back = false
     self:loadNextCard()
+end
+
+function AnkiViewerStudyScreen:showFullText()
+    if not self.card_full_text or self.card_full_text == "" then
+        return
+    end
+    local TextViewer = require("ui/widget/textviewer")
+    local text_viewer = TextViewer:new{
+        title = _("Full Text"),
+        text = self.card_full_text,
+    }
+    UIManager:show(text_viewer)
+end
+
+function AnkiViewerStudyScreen:onDeleteCard()
+    if not self.current_card then
+        return
+    end
+    local card = self.current_card
+    UIManager:show(ConfirmBox:new{
+        text = _("Delete this card?"),
+        ok_text = _("Delete"),
+        cancel_text = _("Cancel"),
+        ok_callback = function()
+            AnkiDB.deleteCard(card.id)
+            self.current_card = nil
+            self.showing_back = false
+            self:loadNextCard()
+        end,
+    })
 end
 
 function AnkiViewerStudyScreen:showSettingsMenu()
@@ -796,6 +943,87 @@ function AnkiViewerStudyScreen:showSettingsMenu()
                 }
                 UIManager:show(input_dialog)
                 input_dialog:onShowKeyboard()
+            end,
+        },
+        {
+            text = _("Fullscreen study mode"),
+            keep_menu_open = true,
+            mandatory_func = function()
+                if not study.plugin then
+                    return "OFF"
+                end
+                if study.plugin:readSetting("fullscreen_study", false) then
+                    return "ON"
+                end
+                return "OFF"
+            end,
+            checked_func = function()
+                if not study.plugin then
+                    return false
+                end
+                return not not study.plugin:readSetting("fullscreen_study", false)
+            end,
+            callback = function()
+                if not study.plugin then
+                    return
+                end
+                local current = not not study.plugin:readSetting("fullscreen_study", false)
+                study.plugin:saveSetting("fullscreen_study", not current)
+                UIManager:show(InfoMessage:new{
+                    text = _("Fullscreen mode will take effect on next study session."),
+                    timeout = 3,
+                })
+                if menu and menu.updateItems then
+                    menu:updateItems(3, true)
+                end
+            end,
+        },
+        {
+            text = _("Minimum interval (days)"),
+            keep_menu_open = true,
+            mandatory_func = function()
+                if not study.plugin then
+                    return _("Default")
+                end
+                local val = tonumber(study.plugin:readSetting("min_interval_days", 0)) or 0
+                if val == 0 then
+                    return _("Default")
+                end
+                return tostring(val) .. "d"
+            end,
+            callback = function()
+                if not study.plugin then
+                    return
+                end
+                local options = {
+                    { text = _("Default (no minimum)"), value = 0 },
+                    { text = _("1 day"), value = 1 },
+                    { text = _("3 days"), value = 3 },
+                    { text = _("7 days"), value = 7 },
+                    { text = _("14 days"), value = 14 },
+                }
+                local buttons = {}
+                for i, opt in ipairs(options) do
+                    table.insert(buttons, {
+                        {
+                            text = opt.text,
+                            callback = function()
+                                study.plugin:saveSetting("min_interval_days", opt.value)
+                                UIManager:show(InfoMessage:new{
+                                    text = _("Minimum interval updated."),
+                                    timeout = 2,
+                                })
+                                if menu and menu.updateItems then
+                                    menu:updateItems(4, true)
+                                end
+                            end,
+                        },
+                    })
+                end
+                UIManager:show(require("ui/widget/buttondialog"):new{
+                    title = _("Set minimum interval"),
+                    buttons = buttons,
+                })
             end,
         },
         {

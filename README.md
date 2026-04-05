@@ -59,8 +59,21 @@ If the `ankiviewer` or `shared` folders do not exist, the plugin will create the
    - Use the **Decks** button to pick which deck to review.  
    - Tap **Show answer** to reveal the back of the card.  
    - Rate the card (**Again / Hard / Good / Easy**) to schedule future reviews.
+   - **Delete** individual cards directly from the study screen if needed.
+   - Tap on the card content to view the full text in a scrollable popup (useful for long cards).
 
 Imported decks and review progress are stored in KOReader's data directory; removing the original `.apkg` file from `ankiviewer/shared` does **not** delete the already-imported deck.
+
+## Features
+
+- **Fullscreen Study Mode** – Toggle fullscreen mode in Settings to maximize card display area. Takes effect on next study session.
+- **Minimum Interval Setting** – Set a minimum interval (1d, 3d, 7d, 14d) to prevent cards from being reviewed too frequently. The minimum applies to the "Again" rating, with other ratings scaling proportionally.
+- **Delete Cards** – Remove individual cards from the study screen with a confirmation dialog.
+- **Tap to View Full Text** – Tap on card content to view complete text in a scrollable popup.
+- **Enhanced Touch Areas** – Rating button tap areas extend upward to include interval labels for easier tapping.
+- **Randomize Cards** – Optionally randomize cards with the same due date.
+- **Daily New Card Limit** – Control how many new cards you see per day.
+- **Field Mapping** – Customize which Anki fields appear on the front and back of cards.
 
 ## Notes and limitations
 

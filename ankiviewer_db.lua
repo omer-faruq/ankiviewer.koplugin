@@ -174,6 +174,20 @@ function DB.deleteDeck(deck_id)
     end)
 end
 
+function DB.deleteCard(card_id)
+    if not card_id then
+        return false, "Missing card id"
+    end
+    DB.init()
+    return withConnection(function(conn)
+        local stmt = conn:prepare("DELETE FROM cards WHERE id = ?;")
+        stmt:bind(card_id)
+        stmt:step()
+        stmt:close()
+        return true
+    end)
+end
+
 function DB.storeSourceNotes(deck_id, notes)
     if not deck_id then
         return nil, "Missing deck id"
@@ -327,12 +341,13 @@ function DB.ensureSampleData()
     end)
 end
 
-local function computeScheduling(card, rating, now_ts)
+local function computeScheduling(card, rating, now_ts, min_interval_days)
     local ease = card.ease or 2.5
     local interval = card.interval or 0
     local reps = card.reps or 0
     local lapses = card.lapses or 0
     local now = now_ts or os.time()
+    local min_interval_multiplier = tonumber(min_interval_days) or 0
 
     local is_new = (interval == 0) and (reps == 0)
 
@@ -341,22 +356,40 @@ local function computeScheduling(card, rating, now_ts)
         if rating == "again" then
             lapses = lapses + 1
             ease = math.max(1.3, ease - 0.2)
-            local due = now + 1 * 60 -- ~<1m
-            return ease, interval, reps, lapses, due
+            if min_interval_multiplier > 0 then
+                interval = min_interval_multiplier
+                local due = now + interval * 86400
+                return ease, interval, reps, lapses, due
+            else
+                local due = now + 1 * 60
+                return ease, interval, reps, lapses, due
+            end
         elseif rating == "hard" then
             reps = reps + 1
             ease = math.max(1.3, ease - 0.15)
-            local due = now + 6 * 60 -- ~<6m
-            return ease, interval, reps, lapses, due
+            if min_interval_multiplier > 0 then
+                interval = min_interval_multiplier * 1.5
+                local due = now + interval * 86400
+                return ease, interval, reps, lapses, due
+            else
+                local due = now + 6 * 60
+                return ease, interval, reps, lapses, due
+            end
         elseif rating == "good" then
             reps = reps + 1
-            local due = now + 10 * 60 -- ~<10m
-            return ease, interval, reps, lapses, due
+            if min_interval_multiplier > 0 then
+                interval = min_interval_multiplier * 2
+                local due = now + interval * 86400
+                return ease, interval, reps, lapses, due
+            else
+                local due = now + 10 * 60
+                return ease, interval, reps, lapses, due
+            end
         elseif rating == "easy" then
             reps = reps + 1
             ease = ease + 0.15
-            interval = 4 -- days
-            local due = now + interval * 86400 -- 4d
+            interval = min_interval_multiplier > 0 and (min_interval_multiplier * 4) or 4
+            local due = now + interval * 86400
             return ease, interval, reps, lapses, due
         end
     end
@@ -365,10 +398,16 @@ local function computeScheduling(card, rating, now_ts)
     if rating == "again" then
         reps = 0
         lapses = lapses + 1
-        interval = 0
         ease = math.max(1.3, ease - 0.2)
-        local due = now + 10 * 60
-        return ease, interval, reps, lapses, due
+        if min_interval_multiplier > 0 then
+            interval = min_interval_multiplier
+            local due = now + interval * 86400
+            return ease, interval, reps, lapses, due
+        else
+            interval = 0
+            local due = now + 10 * 60
+            return ease, interval, reps, lapses, due
+        end
     elseif rating == "hard" then
         reps = reps + 1
         ease = math.max(1.3, ease - 0.15)
@@ -376,6 +415,9 @@ local function computeScheduling(card, rating, now_ts)
             interval = 1
         end
         interval = interval * 1.2
+        if min_interval_multiplier > 0 then
+            interval = math.max(interval, min_interval_multiplier * 1.5)
+        end
         local due = now + interval * 86400
         return ease, interval, reps, lapses, due
     elseif rating == "good" then
@@ -384,6 +426,9 @@ local function computeScheduling(card, rating, now_ts)
             interval = 1
         else
             interval = interval * ease
+        end
+        if min_interval_multiplier > 0 then
+            interval = math.max(interval, min_interval_multiplier * 2)
         end
         local due = now + interval * 86400
         return ease, interval, reps, lapses, due
@@ -394,6 +439,9 @@ local function computeScheduling(card, rating, now_ts)
             interval = 3
         else
             interval = interval * ease * 1.3
+        end
+        if min_interval_multiplier > 0 then
+            interval = math.max(interval, min_interval_multiplier * 4)
         end
         local due = now + interval * 86400
         return ease, interval, reps, lapses, due
@@ -566,7 +614,7 @@ function DB.fetchNextDueCard(deck_id, now_ts, randomize_equal_due, daily_new_lim
     end)
 end
 
-function DB.previewIntervals(card, now_ts)
+function DB.previewIntervals(card, now_ts, min_interval_days)
     if not card or not card.id then
         return nil
     end
@@ -574,7 +622,7 @@ function DB.previewIntervals(card, now_ts)
     local result = {}
     local ratings = { "again", "hard", "good", "easy" }
     for _, rating in ipairs(ratings) do
-        local ease, interval, reps, lapses, due = computeScheduling(card, rating, now)
+        local ease, interval, reps, lapses, due = computeScheduling(card, rating, now, min_interval_days)
         local delta = due - now
         result[rating] = {
             ease = ease,
@@ -588,13 +636,13 @@ function DB.previewIntervals(card, now_ts)
     return result
 end
 
-function DB.updateCardScheduling(card, rating, now_ts)
+function DB.updateCardScheduling(card, rating, now_ts, min_interval_days)
     if not card or not card.id then
         return nil
     end
     DB.init()
     local now = now_ts or os.time()
-    local new_ease, new_interval, new_reps, new_lapses, new_due = computeScheduling(card, rating, now)
+    local new_ease, new_interval, new_reps, new_lapses, new_due = computeScheduling(card, rating, now, min_interval_days)
     withConnection(function(conn)
         local stmt = conn:prepare([[UPDATE cards
             SET ease = ?, interval = ?, due = ?, reps = ?, lapses = ?, updated_at = ?
