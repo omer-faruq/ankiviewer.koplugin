@@ -306,6 +306,7 @@ local function extractCardsFromQuery(conn, sql)
             break
         end
         local flds = row[1]
+        local key = row[2] and tostring(row[2]) or nil
         if type(flds) == "string" and flds ~= "" then
             local parts = {}
             local sep = string.char(31)
@@ -337,6 +338,7 @@ local function extractCardsFromQuery(conn, sql)
                 cards[#cards + 1] = {
                     front = front,
                     back = back,
+                    key = key,
                 }
             end
         end
@@ -385,7 +387,7 @@ local function collectRawNotes(collection_path)
     local conn = SQ3.open(collection_path, "ro")
     conn:set_busy_timeout(5000)
     local notes = {}
-    local stmt = conn:prepare("SELECT mid, flds FROM notes;")
+    local stmt = conn:prepare("SELECT mid, flds, guid FROM notes;")
     while true do
         local row = stmt:step()
         if not row then
@@ -397,6 +399,7 @@ local function collectRawNotes(collection_path)
             notes[#notes + 1] = {
                 mid = mid,
                 flds = flds,
+                guid = row[3] and tostring(row[3]) or nil,
             }
         end
     end
@@ -430,7 +433,7 @@ local function collectNoteCards(collection_path, mapping)
         end
 
         if single_mapping and not multiple_mappings then
-            local stmt = conn:prepare("SELECT mid, flds FROM notes;")
+            local stmt = conn:prepare("SELECT mid, flds, guid FROM notes;")
             while true do
                 local row = stmt:step()
                 if not row then
@@ -438,6 +441,7 @@ local function collectNoteCards(collection_path, mapping)
                 end
                 local mid = row[1]
                 local flds = row[2]
+                local key = row[3] and tostring(row[3]) or nil
                 if type(flds) == "string" and flds ~= "" then
                     local values = {}
                     for field in (flds .. sep):gmatch("(.-)" .. sep) do
@@ -472,6 +476,7 @@ local function collectNoteCards(collection_path, mapping)
                         cards[#cards + 1] = {
                             front = front,
                             back = back,
+                            key = key,
                         }
                     end
                 end
@@ -480,7 +485,7 @@ local function collectNoteCards(collection_path, mapping)
             conn:close()
             return cards
         else
-            local stmt = conn:prepare("SELECT mid, flds FROM notes;")
+            local stmt = conn:prepare("SELECT mid, flds, guid FROM notes;")
             while true do
                 local row = stmt:step()
                 if not row then
@@ -490,6 +495,7 @@ local function collectNoteCards(collection_path, mapping)
                 local model_mapping = mapping.models[mid]
                 if model_mapping then
                     local flds = row[2]
+                    local key = row[3] and tostring(row[3]) or nil
                     if type(flds) == "string" and flds ~= "" then
                         local values = {}
                         for field in (flds .. sep):gmatch("(.-)" .. sep) do
@@ -524,6 +530,7 @@ local function collectNoteCards(collection_path, mapping)
                             cards[#cards + 1] = {
                                 front = front,
                                 back = back,
+                                key = key,
                             }
                         end
                     end
@@ -591,7 +598,7 @@ local function collectNoteCards(collection_path, mapping)
         end
 
         local cards_with_templates = {}
-        local stmt = conn:prepare([[SELECT c.ord, n.mid, n.flds
+        local stmt = conn:prepare([[SELECT c.ord, n.mid, n.flds, n.guid
             FROM cards c
             JOIN notes n ON n.id = c.nid;]])
         while true do
@@ -602,6 +609,7 @@ local function collectNoteCards(collection_path, mapping)
             local ord = tonumber(row[1]) or 0
             local mid = tostring(row[2])
             local flds = row[3]
+            local key = row[4] and (tostring(row[4]) .. ":" .. ord) or nil
             if type(flds) == "string" and flds ~= "" then
                 local model = models[mid]
                 if type(model) == "table" then
@@ -622,6 +630,7 @@ local function collectNoteCards(collection_path, mapping)
                             cards_with_templates[#cards_with_templates + 1] = {
                                 front = front,
                                 back = back,
+                                key = key,
                             }
                         end
                     end
@@ -636,12 +645,12 @@ local function collectNoteCards(collection_path, mapping)
     if ok_templates and type(template_cards_or_err) == "table" and #template_cards_or_err > 0 then
         cards = template_cards_or_err
     else
-        cards = extractCardsFromQuery(conn, [[SELECT n.flds
+        cards = extractCardsFromQuery(conn, [[SELECT n.flds, n.guid || ':' || c.ord
             FROM cards c
             JOIN notes n ON n.id = c.nid;]])
 
         if #cards == 0 then
-            cards = extractCardsFromQuery(conn, "SELECT flds FROM notes;")
+            cards = extractCardsFromQuery(conn, "SELECT flds, guid FROM notes;")
         end
     end
 
@@ -700,6 +709,7 @@ function Import.buildCardsFromSourceNotes(notes, mapping)
                     cards[#cards + 1] = {
                         front = front,
                         back = back,
+                        key = note.guid,
                     }
                 end
             end
@@ -741,6 +751,7 @@ function Import.buildCardsFromSourceNotes(notes, mapping)
                     cards[#cards + 1] = {
                         front = front,
                         back = back,
+                        key = note.guid,
                     }
                 end
             end
@@ -749,7 +760,9 @@ function Import.buildCardsFromSourceNotes(notes, mapping)
     return cards
 end
 
-function Import.importApkg(apkg_path, mapping)
+-- merge_opts: nil replaces an existing deck of the same name (progress is
+-- reset); { merge = true, remove_missing = bool } merges into it instead.
+function Import.importApkg(apkg_path, mapping, merge_opts)
     if not apkg_path or apkg_path == "" then
         return false, "Missing apkg path"
     end
@@ -828,13 +841,20 @@ function Import.importApkg(apkg_path, mapping)
     arc:close()
 
     local AnkiDB = require("ankiviewer_db")
-    local ok_db, deck_id, count = pcall(AnkiDB.importSimpleDeckFromPairs, short_name, cards, true)
+    local merge = merge_opts and merge_opts.merge
+    local ok_db, deck_id, count, merge_stats
+    if merge then
+        ok_db, deck_id, count, merge_stats = pcall(AnkiDB.mergeDeckFromPairs, short_name, cards, merge_opts.remove_missing)
+    else
+        ok_db, deck_id, count = pcall(AnkiDB.importSimpleDeckFromPairs, short_name, cards, true)
+    end
     if not ok_db then
-        logger.warn("AnkiViewer: importSimpleDeckFromPairs failed", deck_id)
+        logger.warn("AnkiViewer: storing imported cards failed", deck_id)
         return false, "Failed to import cards into local database"
     end
     if deck_id and raw_notes and #raw_notes > 0 then
-        local ok_store, store_err = pcall(AnkiDB.storeSourceNotes, deck_id, raw_notes)
+        local keep_existing = merge and not merge_opts.remove_missing
+        local ok_store, store_err = pcall(AnkiDB.storeSourceNotes, deck_id, raw_notes, keep_existing)
         if not ok_store then
             logger.warn("AnkiViewer: failed to store source notes for deck", store_err)
         end
@@ -848,6 +868,7 @@ function Import.importApkg(apkg_path, mapping)
         source_total_cards = total_cards,
         source_total_notes = total_notes,
         extracted_cards = #cards,
+        merge_stats = merge_stats,
     }
 end
 

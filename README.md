@@ -49,11 +49,16 @@ If the `ankiviewer` or `shared` folders do not exist, the plugin will create the
    - From the study screen, tap **Import**.  
    - The plugin will list all `.apkg` files found in `ankiviewer/shared`.  
    - Choose a file to import. The cards will be converted into a local KOReader deck.
+   - **Updating a deck you already study:** export the deck from Anki again (same file name) and import it. When a deck with that name exists you can choose:
+     - **Merge (keep progress)**: new cards are added, edited cards get their new text, and your review progress is kept. Cards are matched by their Anki note ID, so editing a card in Anki does not reset it.
+     - **Merge and remove cards not in file**: same, but cards you deleted in Anki are also removed.
+     - **Replace (reset progress)**: the old behavior; the deck is rebuilt from scratch.
 
 4. **Configure field mapping (optional but recommended)**  
    - Different Anki decks use different fields (front, back, examples, hints, etc.).  
    - Use the **Settings** button on the study screen to open the field mapping dialog for the current deck.  
    - There you can choose which Anki fields should appear on the **front** and **back** of the KOReader cards.
+   - Changing the mapping keeps the review progress of the deck's cards (decks imported with older plugin versions need to be re-imported once with **Merge** first).
 
 5. **Study**  
    - Use the **Decks** button to pick which deck to review.  

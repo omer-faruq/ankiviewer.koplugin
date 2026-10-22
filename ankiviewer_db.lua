@@ -47,6 +47,18 @@ local SCHEMA_STATEMENTS = {
     [[CREATE INDEX IF NOT EXISTS idx_daily_new_cards_deck_date ON daily_new_cards(deck_id, date)]],
 }
 
+-- Columns added after schema version 4. They are added in place instead of
+-- bumping DB_SCHEMA_VERSION, because a version bump wipes the database (and
+-- with it all review progress).
+local COLUMN_MIGRATIONS = {
+    { "cards", "source_key", "TEXT" },
+    { "source_notes", "guid", "TEXT" },
+}
+
+local POST_MIGRATION_STATEMENTS = {
+    [[CREATE INDEX IF NOT EXISTS idx_cards_deck_source_key ON cards(deck_id, source_key)]],
+}
+
 local initialized = false
 
 local function execStatements(conn, statements)
@@ -63,6 +75,18 @@ local function execStatements(conn, statements)
             end
         end
     end
+end
+
+local function ensureColumns(conn)
+    for _, def in ipairs(COLUMN_MIGRATIONS) do
+        local table_name, column, decl = def[1], def[2], def[3]
+        local present = tonumber(conn:rowexec(string.format(
+            "SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name = '%s';", table_name, column))) or 0
+        if present == 0 then
+            conn:exec(string.format("ALTER TABLE %s ADD COLUMN %s %s;", table_name, column, decl))
+        end
+    end
+    execStatements(conn, POST_MIGRATION_STATEMENTS)
 end
 
 local function ensureDirectory()
@@ -109,6 +133,7 @@ function DB.init()
     else
         execStatements(conn, SCHEMA_STATEMENTS)
     end
+    ensureColumns(conn)
     conn:close()
     initialized = true
 end
@@ -143,20 +168,143 @@ function DB.importSimpleDeckFromPairs(deck_name, cards, overwrite)
         if not deck_id then
             return nil, "Failed to create or find deck"
         end
-        local insert_card = conn:prepare("INSERT INTO cards (deck_id, front, back) VALUES (?, ?, ?);")
+        local insert_card = conn:prepare("INSERT INTO cards (deck_id, front, back, source_key) VALUES (?, ?, ?, ?);")
         local count = 0
         for _, pair in ipairs(cards) do
             local front = pair.front or ""
             local back = pair.back or ""
             if front ~= "" or back ~= "" then
                 insert_card:reset()
-                insert_card:bind(deck_id, front, back)
+                insert_card:bind(deck_id, front, back, pair.key)
                 insert_card:step()
                 count = count + 1
             end
         end
         insert_card:close()
         return deck_id, count
+    end)
+end
+
+-- Merges cards into a deck while keeping the scheduling of cards that are
+-- already there. Cards are matched by source_key (Anki note guid, plus the
+-- template ord for template-rendered cards); cards imported before keys were
+-- stored fall back to an exact front match. Matched cards get the new text,
+-- unmatched ones are inserted as new, and existing cards missing from the
+-- import are deleted only when remove_missing is set.
+-- Returns deck_id, card count, { kept, added, removed }.
+function DB.mergeDeckFromPairs(deck_name, cards, remove_missing)
+    if not deck_name or deck_name == "" then
+        return nil, "Missing deck name"
+    end
+    if not cards or #cards == 0 then
+        return nil, "No cards to import"
+    end
+    DB.init()
+    return withConnection(function(conn)
+        local existing_id = conn:rowexec(string.format("SELECT id FROM decks WHERE name = '%s';", deck_name:gsub("'", "''")))
+        local deck_id
+        if existing_id then
+            deck_id = tonumber(existing_id)
+        else
+            local insert_deck = conn:prepare("INSERT INTO decks (name) VALUES (?);")
+            insert_deck:bind(deck_name)
+            insert_deck:step()
+            insert_deck:close()
+            local new_id = conn:rowexec("SELECT last_insert_rowid();")
+            deck_id = new_id and tonumber(new_id) or nil
+        end
+        if not deck_id then
+            return nil, "Failed to create or find deck"
+        end
+
+        local by_key = {}
+        local by_front = {}
+        local unmatched = {}
+        local select_cards = conn:prepare("SELECT id, source_key, front FROM cards WHERE deck_id = ? ORDER BY id;")
+        select_cards:bind(deck_id)
+        while true do
+            local row = select_cards:step()
+            if not row then
+                break
+            end
+            local card_id = tonumber(row[1])
+            local key = row[2]
+            unmatched[card_id] = true
+            if key and key ~= "" then
+                by_key[key] = card_id
+            else
+                local front = row[3] or ""
+                local list = by_front[front]
+                if not list then
+                    list = {}
+                    by_front[front] = list
+                end
+                list[#list + 1] = card_id
+            end
+        end
+        select_cards:close()
+
+        local stats = { kept = 0, added = 0, removed = 0 }
+        local seen_keys = {}
+        conn:exec("BEGIN;")
+        local ok, err = pcall(function()
+            local update_card = conn:prepare("UPDATE cards SET front = ?, back = ?, source_key = ? WHERE id = ?;")
+            local insert_card = conn:prepare("INSERT INTO cards (deck_id, front, back, source_key) VALUES (?, ?, ?, ?);")
+            for _, pair in ipairs(cards) do
+                local front = pair.front or ""
+                local back = pair.back or ""
+                if front ~= "" or back ~= "" then
+                    local key = pair.key
+                    if key == "" or (key and seen_keys[key]) then
+                        key = nil
+                    end
+                    if key then
+                        seen_keys[key] = true
+                    end
+                    local card_id = key and by_key[key]
+                    if not card_id then
+                        local list = by_front[front]
+                        while list and #list > 0 and not card_id do
+                            local candidate = table.remove(list, 1)
+                            if unmatched[candidate] then
+                                card_id = candidate
+                            end
+                        end
+                    end
+                    if card_id then
+                        unmatched[card_id] = nil
+                        update_card:reset()
+                        update_card:bind(front, back, key, card_id)
+                        update_card:step()
+                        stats.kept = stats.kept + 1
+                    else
+                        insert_card:reset()
+                        insert_card:bind(deck_id, front, back, key)
+                        insert_card:step()
+                        stats.added = stats.added + 1
+                    end
+                end
+            end
+            update_card:close()
+            insert_card:close()
+
+            if remove_missing then
+                local delete_card = conn:prepare("DELETE FROM cards WHERE id = ?;")
+                for card_id in pairs(unmatched) do
+                    delete_card:reset()
+                    delete_card:bind(card_id)
+                    delete_card:step()
+                    stats.removed = stats.removed + 1
+                end
+                delete_card:close()
+            end
+        end)
+        if not ok then
+            conn:exec("ROLLBACK;")
+            error(err)
+        end
+        conn:exec("COMMIT;")
+        return deck_id, stats.kept + stats.added, stats
     end)
 end
 
@@ -188,27 +336,46 @@ function DB.deleteCard(card_id)
     end)
 end
 
-function DB.storeSourceNotes(deck_id, notes)
+-- With keep_existing, notes from earlier imports stay unless the new set
+-- carries the same guid (or they predate guid storage), so a merge of a
+-- partial export does not drop the deck's other notes.
+function DB.storeSourceNotes(deck_id, notes, keep_existing)
     if not deck_id then
         return nil, "Missing deck id"
     end
     DB.init()
     return withConnection(function(conn)
-        local delete_stmt = conn:prepare("DELETE FROM source_notes WHERE deck_id = ?;")
-        delete_stmt:bind(deck_id)
-        delete_stmt:step()
-        delete_stmt:close()
+        if keep_existing then
+            local delete_legacy = conn:prepare("DELETE FROM source_notes WHERE deck_id = ? AND guid IS NULL;")
+            delete_legacy:bind(deck_id)
+            delete_legacy:step()
+            delete_legacy:close()
+            local delete_guid = conn:prepare("DELETE FROM source_notes WHERE deck_id = ? AND guid = ?;")
+            for _, note in ipairs(notes or {}) do
+                if note.guid then
+                    delete_guid:reset()
+                    delete_guid:bind(deck_id, note.guid)
+                    delete_guid:step()
+                end
+            end
+            delete_guid:close()
+        else
+            local delete_stmt = conn:prepare("DELETE FROM source_notes WHERE deck_id = ?;")
+            delete_stmt:bind(deck_id)
+            delete_stmt:step()
+            delete_stmt:close()
+        end
         if not notes or #notes == 0 then
             return 0
         end
-        local insert_stmt = conn:prepare("INSERT INTO source_notes (deck_id, mid, flds) VALUES (?, ?, ?);")
+        local insert_stmt = conn:prepare("INSERT INTO source_notes (deck_id, mid, flds, guid) VALUES (?, ?, ?, ?);")
         local count = 0
         for _, note in ipairs(notes) do
             local mid = note.mid
             local flds = note.flds or ""
             if type(flds) == "string" and flds ~= "" then
                 insert_stmt:reset()
-                insert_stmt:bind(deck_id, mid, flds)
+                insert_stmt:bind(deck_id, mid, flds, note.guid)
                 insert_stmt:step()
                 count = count + 1
             end
@@ -224,7 +391,7 @@ function DB.loadSourceNotes(deck_id)
     end
     DB.init()
     return withConnection(function(conn)
-        local stmt = conn:prepare("SELECT mid, flds FROM source_notes WHERE deck_id = ? ORDER BY id;")
+        local stmt = conn:prepare("SELECT mid, flds, guid FROM source_notes WHERE deck_id = ? ORDER BY id;")
         stmt:bind(deck_id)
         local notes = {}
         while true do
@@ -238,6 +405,7 @@ function DB.loadSourceNotes(deck_id)
                 notes[#notes + 1] = {
                     mid = mid,
                     flds = flds,
+                    guid = row[3],
                 }
             end
         end

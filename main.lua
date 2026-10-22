@@ -1,6 +1,7 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local ButtonTable = require("ui/widget/buttontable")
 local Button = require("ui/widget/button")
+local ButtonDialog = require("ui/widget/buttondialog")
 local Device = require("device")
 local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
@@ -1334,7 +1335,9 @@ function AnkiViewer:openCurrentDeckFieldMapping(study_screen)
             if deck_id then
                 self:_reimportFromSourceNotes(deck_id, deck_title, mapping, file)
             else
-                self:_performApkgImport(file, mapping)
+                self:_chooseImportMode(effective_short, function(merge_opts)
+                    self:_performApkgImport(file, mapping, merge_opts)
+                end)
             end
         else
             local msg = InfoMessage:new{
@@ -1347,7 +1350,55 @@ function AnkiViewer:openCurrentDeckFieldMapping(study_screen)
     end)
 end
 
-function AnkiViewer:_performApkgImport(file, mapping)
+-- Calls on_choice(merge_opts) once the user picked how to import a deck that
+-- already exists (merge_opts is nil for replace); calls it right away with
+-- nil when no deck with that name exists yet.
+function AnkiViewer:_chooseImportMode(deck_name, on_choice)
+    local exists = false
+    local ok_decks, decks = pcall(AnkiDB.listDecks)
+    if ok_decks and type(decks) == "table" then
+        for _, deck in ipairs(decks) do
+            if deck.name == deck_name then
+                exists = true
+                break
+            end
+        end
+    end
+    if not exists then
+        on_choice(nil)
+        return
+    end
+
+    local dialog
+    local function choose(merge_opts)
+        UIManager:close(dialog)
+        on_choice(merge_opts)
+    end
+    dialog = ButtonDialog:new{
+        title = string.format(_("Deck '%s' already exists."), deck_name),
+        buttons = {
+            {{
+                text = _("Merge (keep progress)"),
+                callback = function() choose({ merge = true }) end,
+            }},
+            {{
+                text = _("Merge and remove cards not in file"),
+                callback = function() choose({ merge = true, remove_missing = true }) end,
+            }},
+            {{
+                text = _("Replace (reset progress)"),
+                callback = function() choose(nil) end,
+            }},
+            {{
+                text = _("Cancel"),
+                callback = function() UIManager:close(dialog) end,
+            }},
+        },
+    }
+    UIManager:show(dialog)
+end
+
+function AnkiViewer:_performApkgImport(file, mapping, merge_opts)
     if not file or not file.path then
         return
     end
@@ -1358,7 +1409,7 @@ function AnkiViewer:_performApkgImport(file, mapping)
     }
     UIManager:show(progress)
 
-    local ok_call, ok_import, payload = pcall(AnkiApkgImport.importApkg, file.path, mapping)
+    local ok_call, ok_import, payload = pcall(AnkiApkgImport.importApkg, file.path, mapping, merge_opts)
     UIManager:close(progress)
 
     local text
@@ -1372,7 +1423,10 @@ function AnkiViewer:_performApkgImport(file, mapping)
             local src_cards = tonumber(info.source_total_cards or 0) or 0
             local src_notes = tonumber(info.source_total_notes or 0) or 0
             local extracted = tonumber(info.extracted_cards or 0) or 0
-            if card_count == 0 then
+            local stats = info.merge_stats
+            if stats then
+                text = string.format(_("Merged into deck '%s': %d new, %d kept, %d removed."), deck_name, stats.added, stats.kept, stats.removed)
+            elseif card_count == 0 then
                 text = string.format(_("Imported deck '%s' with %d cards (source cards: %d, notes: %d, extracted: %d)."), deck_name, card_count, src_cards, src_notes, extracted)
             else
                 text = string.format(_("Imported deck '%s' with %d cards."), deck_name, card_count)
@@ -1391,10 +1445,14 @@ function AnkiViewer:_performApkgImport(file, mapping)
     UIManager:show(msg)
 end
 
+-- Changing the field mapping rebuilds the deck's cards; merging (matched by
+-- note guid) keeps their review progress.
+local REMAP_MERGE_OPTS = { merge = true, remove_missing = true }
+
 function AnkiViewer:_reimportFromSourceNotes(deck_id, deck_name, mapping, file)
     if not deck_id or not mapping then
         if file then
-            self:_performApkgImport(file, mapping)
+            self:_performApkgImport(file, mapping, REMAP_MERGE_OPTS)
         end
         return
     end
@@ -1416,7 +1474,7 @@ function AnkiViewer:_reimportFromSourceNotes(deck_id, deck_name, mapping, file)
     if not notes or #notes == 0 then
         UIManager:close(progress)
         if file then
-            self:_performApkgImport(file, mapping)
+            self:_performApkgImport(file, mapping, REMAP_MERGE_OPTS)
         else
             local msg = InfoMessage:new{
                 text = _("No stored source notes are available for this deck; cannot rebuild cards."),
@@ -1440,7 +1498,7 @@ function AnkiViewer:_reimportFromSourceNotes(deck_id, deck_name, mapping, file)
         return
     end
 
-    local ok_db, imported_deck_id, count = pcall(AnkiDB.importSimpleDeckFromPairs, deck_name, cards, true)
+    local ok_db, imported_deck_id, count = pcall(AnkiDB.mergeDeckFromPairs, deck_name, cards, true)
     UIManager:close(progress)
 
     local text
@@ -1888,7 +1946,9 @@ function AnkiViewer:importLocalApkg()
                         mapping.short_name = short_name
                         saveFieldMappingForShortName(short_name, mapping)
                     end
-                    self:_performApkgImport(file, mapping)
+                    self:_chooseImportMode(short_name, function(merge_opts)
+                        self:_performApkgImport(file, mapping, merge_opts)
+                    end)
                 end)
             end,
         })
