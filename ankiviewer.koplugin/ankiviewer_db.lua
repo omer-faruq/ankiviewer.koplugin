@@ -1,0 +1,835 @@
+local DataStorage = require("datastorage")
+local SQ3 = require("lua-ljsqlite3/init")
+local ffiUtil = require("ffi/util")
+local util = require("util")
+local logger = require("logger")
+
+local DB = {}
+
+local DB_SCHEMA_VERSION = 4
+local DB_DIRECTORY = ffiUtil.joinPath(DataStorage:getDataDir(), "ankiviewer")
+local DB_PATH = ffiUtil.joinPath(DB_DIRECTORY, "ankiviewer.sqlite3")
+
+local SCHEMA_STATEMENTS = {
+    [[CREATE TABLE IF NOT EXISTS decks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE
+    )]],
+    [[CREATE TABLE IF NOT EXISTS cards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        deck_id INTEGER NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
+        front TEXT NOT NULL,
+        back TEXT NOT NULL,
+        ease REAL NOT NULL DEFAULT 2.5,
+        interval REAL NOT NULL DEFAULT 0,
+        due INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+        reps INTEGER NOT NULL DEFAULT 0,
+        lapses INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+        updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    )]],
+    [[CREATE INDEX IF NOT EXISTS idx_cards_deck ON cards(deck_id)]],
+    [[CREATE INDEX IF NOT EXISTS idx_cards_deck_due ON cards(deck_id, due)]],
+    [[CREATE TABLE IF NOT EXISTS source_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        deck_id INTEGER NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
+        mid TEXT,
+        flds TEXT NOT NULL
+    )]],
+    [[CREATE INDEX IF NOT EXISTS idx_source_notes_deck ON source_notes(deck_id)]],
+    [[CREATE TABLE IF NOT EXISTS daily_new_cards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        deck_id INTEGER NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
+        date TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(deck_id, date)
+    )]],
+    [[CREATE INDEX IF NOT EXISTS idx_daily_new_cards_deck_date ON daily_new_cards(deck_id, date)]],
+}
+
+-- Columns added after schema version 4. They are added in place instead of
+-- bumping DB_SCHEMA_VERSION, because a version bump wipes the database (and
+-- with it all review progress).
+local COLUMN_MIGRATIONS = {
+    { "cards", "source_key", "TEXT" },
+    { "source_notes", "guid", "TEXT" },
+}
+
+local POST_MIGRATION_STATEMENTS = {
+    [[CREATE INDEX IF NOT EXISTS idx_cards_deck_source_key ON cards(deck_id, source_key)]],
+}
+
+local initialized = false
+
+local function execStatements(conn, statements)
+    for _, statement in ipairs(statements) do
+        local trimmed = util.trim(statement)
+        if trimmed ~= "" then
+            local final_stmt = trimmed
+            if not final_stmt:find(";%s*$") then
+                final_stmt = final_stmt .. ";"
+            end
+            local ok, err = pcall(conn.exec, conn, final_stmt)
+            if not ok then
+                error(string.format("ankiviewer sqlite schema error: %s -- %s", final_stmt, err))
+            end
+        end
+    end
+end
+
+local function ensureColumns(conn)
+    for _, def in ipairs(COLUMN_MIGRATIONS) do
+        local table_name, column, decl = def[1], def[2], def[3]
+        local present = tonumber(conn:rowexec(string.format(
+            "SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name = '%s';", table_name, column))) or 0
+        if present == 0 then
+            conn:exec(string.format("ALTER TABLE %s ADD COLUMN %s %s;", table_name, column, decl))
+        end
+    end
+    execStatements(conn, POST_MIGRATION_STATEMENTS)
+end
+
+local function ensureDirectory()
+    local ok, err = util.makePath(DB_DIRECTORY)
+    if not ok then
+        logger.warn("ankiviewer: unable to create database directory", err)
+    end
+end
+
+local function openConnection()
+    ensureDirectory()
+    local conn = SQ3.open(DB_PATH)
+    conn:exec("PRAGMA foreign_keys = ON;")
+    conn:exec("PRAGMA synchronous = NORMAL;")
+    conn:exec("PRAGMA journal_mode = WAL;")
+    return conn
+end
+
+local function withConnection(fn)
+    local conn = openConnection()
+    local results = { pcall(fn, conn) }
+    conn:close()
+    if not results[1] then
+        error(results[2])
+    end
+    return table.unpack(results, 2)
+end
+
+function DB.init()
+    if initialized then
+        return
+    end
+    ensureDirectory()
+    local conn = openConnection()
+    local current_version = tonumber(conn:rowexec("PRAGMA user_version;")) or 0
+    if current_version < DB_SCHEMA_VERSION then
+        -- Drop existing schema when we change SRS structure.
+        conn:exec("PRAGMA writable_schema = ON;")
+        conn:exec("DELETE FROM sqlite_master WHERE type IN ('table','index','trigger');")
+        conn:exec("PRAGMA writable_schema = OFF;")
+        conn:exec("VACUUM;")
+        execStatements(conn, SCHEMA_STATEMENTS)
+        conn:exec("PRAGMA user_version = " .. DB_SCHEMA_VERSION .. ";")
+    else
+        execStatements(conn, SCHEMA_STATEMENTS)
+    end
+    ensureColumns(conn)
+    conn:close()
+    initialized = true
+end
+
+function DB.importSimpleDeckFromPairs(deck_name, cards, overwrite)
+    if not deck_name or deck_name == "" then
+        return nil, "Missing deck name"
+    end
+    if not cards or #cards == 0 then
+        return nil, "No cards to import"
+    end
+    DB.init()
+    return withConnection(function(conn)
+        local existing_id = conn:rowexec(string.format("SELECT id FROM decks WHERE name = '%s';", deck_name:gsub("'", "''")))
+        local deck_id
+        if existing_id then
+            deck_id = tonumber(existing_id)
+            if overwrite then
+                local delete_cards = conn:prepare("DELETE FROM cards WHERE deck_id = ?;")
+                delete_cards:bind(deck_id)
+                delete_cards:step()
+                delete_cards:close()
+            end
+        else
+            local insert_deck = conn:prepare("INSERT INTO decks (name) VALUES (?);")
+            insert_deck:bind(deck_name)
+            insert_deck:step()
+            insert_deck:close()
+            local new_id = conn:rowexec("SELECT last_insert_rowid();")
+            deck_id = new_id and tonumber(new_id) or nil
+        end
+        if not deck_id then
+            return nil, "Failed to create or find deck"
+        end
+        local insert_card = conn:prepare("INSERT INTO cards (deck_id, front, back, source_key) VALUES (?, ?, ?, ?);")
+        local count = 0
+        for _, pair in ipairs(cards) do
+            local front = pair.front or ""
+            local back = pair.back or ""
+            if front ~= "" or back ~= "" then
+                insert_card:reset()
+                insert_card:bind(deck_id, front, back, pair.key)
+                insert_card:step()
+                count = count + 1
+            end
+        end
+        insert_card:close()
+        return deck_id, count
+    end)
+end
+
+-- Merges cards into a deck while keeping the scheduling of cards that are
+-- already there. Cards are matched by source_key (Anki note guid, plus the
+-- template ord for template-rendered cards); cards imported before keys were
+-- stored fall back to an exact front match. Matched cards get the new text,
+-- unmatched ones are inserted as new, and existing cards missing from the
+-- import are deleted only when remove_missing is set.
+-- Returns deck_id, card count, { kept, added, removed }.
+function DB.mergeDeckFromPairs(deck_name, cards, remove_missing)
+    if not deck_name or deck_name == "" then
+        return nil, "Missing deck name"
+    end
+    if not cards or #cards == 0 then
+        return nil, "No cards to import"
+    end
+    DB.init()
+    return withConnection(function(conn)
+        local existing_id = conn:rowexec(string.format("SELECT id FROM decks WHERE name = '%s';", deck_name:gsub("'", "''")))
+        local deck_id
+        if existing_id then
+            deck_id = tonumber(existing_id)
+        else
+            local insert_deck = conn:prepare("INSERT INTO decks (name) VALUES (?);")
+            insert_deck:bind(deck_name)
+            insert_deck:step()
+            insert_deck:close()
+            local new_id = conn:rowexec("SELECT last_insert_rowid();")
+            deck_id = new_id and tonumber(new_id) or nil
+        end
+        if not deck_id then
+            return nil, "Failed to create or find deck"
+        end
+
+        local by_key = {}
+        local by_front = {}
+        local unmatched = {}
+        local select_cards = conn:prepare("SELECT id, source_key, front FROM cards WHERE deck_id = ? ORDER BY id;")
+        select_cards:bind(deck_id)
+        while true do
+            local row = select_cards:step()
+            if not row then
+                break
+            end
+            local card_id = tonumber(row[1])
+            local key = row[2]
+            unmatched[card_id] = true
+            if key and key ~= "" then
+                by_key[key] = card_id
+            else
+                local front = row[3] or ""
+                local list = by_front[front]
+                if not list then
+                    list = {}
+                    by_front[front] = list
+                end
+                list[#list + 1] = card_id
+            end
+        end
+        select_cards:close()
+
+        local stats = { kept = 0, added = 0, removed = 0 }
+        local seen_keys = {}
+        conn:exec("BEGIN;")
+        local ok, err = pcall(function()
+            local update_card = conn:prepare("UPDATE cards SET front = ?, back = ?, source_key = ? WHERE id = ?;")
+            local insert_card = conn:prepare("INSERT INTO cards (deck_id, front, back, source_key) VALUES (?, ?, ?, ?);")
+            for _, pair in ipairs(cards) do
+                local front = pair.front or ""
+                local back = pair.back or ""
+                if front ~= "" or back ~= "" then
+                    local key = pair.key
+                    if key == "" or (key and seen_keys[key]) then
+                        key = nil
+                    end
+                    if key then
+                        seen_keys[key] = true
+                    end
+                    local card_id = key and by_key[key]
+                    if not card_id then
+                        local list = by_front[front]
+                        while list and #list > 0 and not card_id do
+                            local candidate = table.remove(list, 1)
+                            if unmatched[candidate] then
+                                card_id = candidate
+                            end
+                        end
+                    end
+                    if card_id then
+                        unmatched[card_id] = nil
+                        update_card:reset()
+                        update_card:bind(front, back, key, card_id)
+                        update_card:step()
+                        stats.kept = stats.kept + 1
+                    else
+                        insert_card:reset()
+                        insert_card:bind(deck_id, front, back, key)
+                        insert_card:step()
+                        stats.added = stats.added + 1
+                    end
+                end
+            end
+            update_card:close()
+            insert_card:close()
+
+            if remove_missing then
+                local delete_card = conn:prepare("DELETE FROM cards WHERE id = ?;")
+                for card_id in pairs(unmatched) do
+                    delete_card:reset()
+                    delete_card:bind(card_id)
+                    delete_card:step()
+                    stats.removed = stats.removed + 1
+                end
+                delete_card:close()
+            end
+        end)
+        if not ok then
+            conn:exec("ROLLBACK;")
+            error(err)
+        end
+        conn:exec("COMMIT;")
+        return deck_id, stats.kept + stats.added, stats
+    end)
+end
+
+function DB.deleteDeck(deck_id)
+    if not deck_id then
+        return false, "Missing deck id"
+    end
+    DB.init()
+    return withConnection(function(conn)
+        local stmt = conn:prepare("DELETE FROM decks WHERE id = ?;")
+        stmt:bind(deck_id)
+        stmt:step()
+        stmt:close()
+        return true
+    end)
+end
+
+function DB.deleteCard(card_id)
+    if not card_id then
+        return false, "Missing card id"
+    end
+    DB.init()
+    return withConnection(function(conn)
+        local stmt = conn:prepare("DELETE FROM cards WHERE id = ?;")
+        stmt:bind(card_id)
+        stmt:step()
+        stmt:close()
+        return true
+    end)
+end
+
+-- With keep_existing, notes from earlier imports stay unless the new set
+-- carries the same guid (or they predate guid storage), so a merge of a
+-- partial export does not drop the deck's other notes.
+function DB.storeSourceNotes(deck_id, notes, keep_existing)
+    if not deck_id then
+        return nil, "Missing deck id"
+    end
+    DB.init()
+    return withConnection(function(conn)
+        if keep_existing then
+            local delete_legacy = conn:prepare("DELETE FROM source_notes WHERE deck_id = ? AND guid IS NULL;")
+            delete_legacy:bind(deck_id)
+            delete_legacy:step()
+            delete_legacy:close()
+            local delete_guid = conn:prepare("DELETE FROM source_notes WHERE deck_id = ? AND guid = ?;")
+            for _, note in ipairs(notes or {}) do
+                if note.guid then
+                    delete_guid:reset()
+                    delete_guid:bind(deck_id, note.guid)
+                    delete_guid:step()
+                end
+            end
+            delete_guid:close()
+        else
+            local delete_stmt = conn:prepare("DELETE FROM source_notes WHERE deck_id = ?;")
+            delete_stmt:bind(deck_id)
+            delete_stmt:step()
+            delete_stmt:close()
+        end
+        if not notes or #notes == 0 then
+            return 0
+        end
+        local insert_stmt = conn:prepare("INSERT INTO source_notes (deck_id, mid, flds, guid) VALUES (?, ?, ?, ?);")
+        local count = 0
+        for _, note in ipairs(notes) do
+            local mid = note.mid
+            local flds = note.flds or ""
+            if type(flds) == "string" and flds ~= "" then
+                insert_stmt:reset()
+                insert_stmt:bind(deck_id, mid, flds, note.guid)
+                insert_stmt:step()
+                count = count + 1
+            end
+        end
+        insert_stmt:close()
+        return count
+    end)
+end
+
+function DB.loadSourceNotes(deck_id)
+    if not deck_id then
+        return {}
+    end
+    DB.init()
+    return withConnection(function(conn)
+        local stmt = conn:prepare("SELECT mid, flds, guid FROM source_notes WHERE deck_id = ? ORDER BY id;")
+        stmt:bind(deck_id)
+        local notes = {}
+        while true do
+            local row = stmt:step()
+            if not row then
+                break
+            end
+            local mid = row[1]
+            local flds = row[2]
+            if type(flds) == "string" and flds ~= "" then
+                notes[#notes + 1] = {
+                    mid = mid,
+                    flds = flds,
+                    guid = row[3],
+                }
+            end
+        end
+        stmt:close()
+        return notes
+    end)
+end
+
+local function getOrCreateDefaultDeckId(conn)
+    local existing_id = conn:rowexec("SELECT id FROM decks WHERE name = 'Default';")
+    if existing_id then
+        return tonumber(existing_id)
+    end
+    conn:exec("INSERT INTO decks (name) VALUES ('Default');")
+    local new_id = conn:rowexec("SELECT last_insert_rowid();")
+    return new_id and tonumber(new_id) or nil
+end
+
+local function coerceNumber(value, default)
+    if value == nil then
+        return default
+    end
+    local n = tonumber(value)
+    if not n then
+        return default
+    end
+    return n
+end
+
+local function mapCardRow(row)
+    if not row then
+        return nil
+    end
+    return {
+        id = coerceNumber(row.id, nil),
+        deck_id = coerceNumber(row.deck_id, nil),
+        front = row.front,
+        back = row.back,
+        ease = coerceNumber(row.ease, 2.5),
+        interval = coerceNumber(row.interval, 0),
+        due = coerceNumber(row.due, os.time()),
+        reps = coerceNumber(row.reps, 0),
+        lapses = coerceNumber(row.lapses, 0),
+    }
+end
+
+function DB.listDecks()
+    DB.init()
+    return withConnection(function(conn)
+        local stmt = conn:prepare([[SELECT d.id, d.name, COUNT(c.id) AS card_count
+            FROM decks d
+            LEFT JOIN cards c ON c.deck_id = d.id
+            GROUP BY d.id, d.name
+            ORDER BY d.name COLLATE NOCASE;]])
+        local rows = stmt:resultset("hik")
+        stmt:close()
+        if not rows or not rows[0] or #rows[0] == 0 then
+            return {}
+        end
+        local headers = rows[0]
+        local list = {}
+        for i = 1, #rows[1] do
+            local row = {}
+            for col_index, col_name in ipairs(headers) do
+                local column_values = rows[col_index]
+                row[col_name] = column_values[i]
+            end
+            list[#list + 1] = {
+                id = coerceNumber(row.id, nil),
+                name = tostring(row.name or ""),
+                card_count = coerceNumber(row.card_count, 0),
+            }
+        end
+        return list
+    end)
+end
+
+function DB.ensureSampleData()
+    DB.init()
+    return withConnection(function(conn)
+        local deck_id = getOrCreateDefaultDeckId(conn)
+        if not deck_id then
+            return nil
+        end
+        local count = tonumber(conn:rowexec(string.format("SELECT COUNT(*) FROM cards WHERE deck_id = %d;", deck_id))) or 0
+        if count == 0 then
+            local insert_stmt = conn:prepare("INSERT INTO cards (deck_id, front, back) VALUES (?, ?, ?);")
+            local samples = {
+                { "Capital of France?", "Paris" },
+                { "2 + 2 = ?", "4" },
+                { "Author of \"1984\"?", "George Orwell" },
+            }
+            for _, pair in ipairs(samples) do
+                insert_stmt:reset()
+                insert_stmt:bind(deck_id, pair[1], pair[2])
+                insert_stmt:step()
+            end
+            insert_stmt:close()
+        end
+        return deck_id
+    end)
+end
+
+local function computeScheduling(card, rating, now_ts, min_interval_days)
+    local ease = card.ease or 2.5
+    local interval = card.interval or 0
+    local reps = card.reps or 0
+    local lapses = card.lapses or 0
+    local now = now_ts or os.time()
+    local min_interval_multiplier = tonumber(min_interval_days) or 0
+
+    local is_new = (interval == 0) and (reps == 0)
+
+    -- New card behavior: mimic Anki-style initial steps
+    if is_new then
+        if rating == "again" then
+            lapses = lapses + 1
+            ease = math.max(1.3, ease - 0.2)
+            if min_interval_multiplier > 0 then
+                interval = min_interval_multiplier
+                local due = now + interval * 86400
+                return ease, interval, reps, lapses, due
+            else
+                local due = now + 1 * 60
+                return ease, interval, reps, lapses, due
+            end
+        elseif rating == "hard" then
+            reps = reps + 1
+            ease = math.max(1.3, ease - 0.15)
+            if min_interval_multiplier > 0 then
+                interval = min_interval_multiplier * 1.5
+                local due = now + interval * 86400
+                return ease, interval, reps, lapses, due
+            else
+                local due = now + 6 * 60
+                return ease, interval, reps, lapses, due
+            end
+        elseif rating == "good" then
+            reps = reps + 1
+            if min_interval_multiplier > 0 then
+                interval = min_interval_multiplier * 2
+                local due = now + interval * 86400
+                return ease, interval, reps, lapses, due
+            else
+                local due = now + 10 * 60
+                return ease, interval, reps, lapses, due
+            end
+        elseif rating == "easy" then
+            reps = reps + 1
+            ease = ease + 0.15
+            interval = min_interval_multiplier > 0 and (min_interval_multiplier * 4) or 4
+            local due = now + interval * 86400
+            return ease, interval, reps, lapses, due
+        end
+    end
+
+    -- Review card behavior (simplified SM-2 style)
+    if rating == "again" then
+        reps = 0
+        lapses = lapses + 1
+        ease = math.max(1.3, ease - 0.2)
+        if min_interval_multiplier > 0 then
+            interval = min_interval_multiplier
+            local due = now + interval * 86400
+            return ease, interval, reps, lapses, due
+        else
+            interval = 0
+            local due = now + 10 * 60
+            return ease, interval, reps, lapses, due
+        end
+    elseif rating == "hard" then
+        reps = reps + 1
+        ease = math.max(1.3, ease - 0.15)
+        if interval < 1 then
+            interval = 1
+        end
+        interval = interval * 1.2
+        if min_interval_multiplier > 0 then
+            interval = math.max(interval, min_interval_multiplier * 1.5)
+        end
+        local due = now + interval * 86400
+        return ease, interval, reps, lapses, due
+    elseif rating == "good" then
+        reps = reps + 1
+        if interval == 0 then
+            interval = 1
+        else
+            interval = interval * ease
+        end
+        if min_interval_multiplier > 0 then
+            interval = math.max(interval, min_interval_multiplier * 2)
+        end
+        local due = now + interval * 86400
+        return ease, interval, reps, lapses, due
+    elseif rating == "easy" then
+        reps = reps + 1
+        ease = ease + 0.15
+        if interval == 0 then
+            interval = 3
+        else
+            interval = interval * ease * 1.3
+        end
+        if min_interval_multiplier > 0 then
+            interval = math.max(interval, min_interval_multiplier * 4)
+        end
+        local due = now + interval * 86400
+        return ease, interval, reps, lapses, due
+    end
+
+    return ease, interval, reps, lapses, card.due or now
+end
+
+local function formatDelta(delta)
+    if delta <= 0 then
+        return "0m"
+    end
+    if delta < 3600 then
+        local minutes = math.floor(delta / 60 + 0.5)
+        return tostring(minutes) .. "m"
+    end
+    if delta < 86400 then
+        local hours = math.floor(delta / 3600 + 0.5)
+        return tostring(hours) .. "h"
+    end
+    local days = math.floor(delta / 86400 + 0.5)
+    return tostring(days) .. "d"
+end
+
+local function getTodayDateString()
+    return os.date("%Y-%m-%d", os.time())
+end
+
+function DB.getDailyNewCardsCount(deck_id)
+    DB.init()
+    if not deck_id then
+        return 0
+    end
+    local today = getTodayDateString()
+    return withConnection(function(conn)
+        local stmt = conn:prepare([[SELECT count FROM daily_new_cards WHERE deck_id = ? AND date = ?;]])
+        stmt:bind(deck_id, today)
+        local count_str = stmt:step()
+        stmt:close()
+        if count_str and count_str[1] then
+            return tonumber(count_str[1]) or 0
+        end
+        return 0
+    end)
+end
+
+function DB.incrementDailyNewCardsCount(deck_id)
+    DB.init()
+    if not deck_id then
+        return
+    end
+    local today = getTodayDateString()
+    withConnection(function(conn)
+        local stmt = conn:prepare([[INSERT INTO daily_new_cards (deck_id, date, count) VALUES (?, ?, 1)
+            ON CONFLICT(deck_id, date) DO UPDATE SET count = count + 1;]])
+        stmt:bind(deck_id, today)
+        stmt:step()
+        stmt:close()
+    end)
+end
+
+function DB.fetchNextDueCard(deck_id, now_ts, randomize_equal_due, daily_new_limit)
+    DB.init()
+    if not deck_id then
+        return nil
+    end
+    local now = now_ts or os.time()
+    return withConnection(function(conn)
+        randomize_equal_due = not not randomize_equal_due
+        local new_limit = tonumber(daily_new_limit) or 0
+        local today_new_count = 0
+        
+        if new_limit > 0 then
+            local today = getTodayDateString()
+            local count_stmt = conn:prepare([[SELECT count FROM daily_new_cards WHERE deck_id = ? AND date = ?;]])
+            count_stmt:bind(deck_id, today)
+            local count_row = count_stmt:step()
+            count_stmt:close()
+            if count_row and count_row[1] then
+                today_new_count = tonumber(count_row[1]) or 0
+            end
+        end
+        
+        local stmt
+        if randomize_equal_due then
+            if new_limit > 0 and today_new_count >= new_limit then
+                stmt = conn:prepare([[WITH mindue AS (
+                        SELECT MIN(due) AS due
+                        FROM cards
+                        WHERE deck_id = ? AND due <= ? AND NOT (reps = 0 AND interval = 0)
+                    ), candidates AS (
+                        SELECT id
+                        FROM cards
+                        WHERE deck_id = ? AND due = (SELECT due FROM mindue) AND NOT (reps = 0 AND interval = 0)
+                    ), stats AS (
+                        SELECT COUNT(*) AS cnt FROM candidates
+                    ), picked AS (
+                        SELECT id
+                        FROM candidates
+                        LIMIT 1
+                        OFFSET (
+                            CASE
+                                WHEN (SELECT cnt FROM stats) <= 1 THEN 0
+                                ELSE (abs(random()) % (SELECT cnt FROM stats))
+                            END
+                        )
+                    )
+                    SELECT id, deck_id, front, back, ease, interval, due, reps, lapses
+                    FROM cards
+                    WHERE id = (SELECT id FROM picked)
+                    LIMIT 1;]])
+                stmt:bind(deck_id, now, deck_id)
+            else
+                stmt = conn:prepare([[WITH mindue AS (
+                        SELECT MIN(due) AS due
+                        FROM cards
+                        WHERE deck_id = ? AND due <= ?
+                    ), candidates AS (
+                        SELECT id
+                        FROM cards
+                        WHERE deck_id = ? AND due = (SELECT due FROM mindue)
+                    ), stats AS (
+                        SELECT COUNT(*) AS cnt FROM candidates
+                    ), picked AS (
+                        SELECT id
+                        FROM candidates
+                        LIMIT 1
+                        OFFSET (
+                            CASE
+                                WHEN (SELECT cnt FROM stats) <= 1 THEN 0
+                                ELSE (abs(random()) % (SELECT cnt FROM stats))
+                            END
+                        )
+                    )
+                    SELECT id, deck_id, front, back, ease, interval, due, reps, lapses
+                    FROM cards
+                    WHERE id = (SELECT id FROM picked)
+                    LIMIT 1;]])
+                stmt:bind(deck_id, now, deck_id)
+            end
+        else
+            if new_limit > 0 and today_new_count >= new_limit then
+                stmt = conn:prepare([[SELECT id, deck_id, front, back, ease, interval, due, reps, lapses
+                    FROM cards
+                    WHERE deck_id = ? AND due <= ? AND NOT (reps = 0 AND interval = 0)
+                    ORDER BY due ASC
+                    LIMIT 1;]])
+                stmt:bind(deck_id, now)
+            else
+                stmt = conn:prepare([[SELECT id, deck_id, front, back, ease, interval, due, reps, lapses
+                    FROM cards
+                    WHERE deck_id = ? AND due <= ?
+                    ORDER BY due ASC
+                    LIMIT 1;]])
+                stmt:bind(deck_id, now)
+            end
+        end
+        local rows = stmt:resultset("hik")
+        stmt:close()
+        if not rows or not rows[1] or #rows[1] == 0 then
+            return nil
+        end
+        local headers = rows[0]
+        local row = {}
+        for header_index, header in ipairs(headers) do
+            local column_values = rows[header_index]
+            row[header] = column_values[1]
+        end
+        return mapCardRow(row)
+    end)
+end
+
+function DB.previewIntervals(card, now_ts, min_interval_days)
+    if not card or not card.id then
+        return nil
+    end
+    local now = now_ts or os.time()
+    local result = {}
+    local ratings = { "again", "hard", "good", "easy" }
+    for _, rating in ipairs(ratings) do
+        local ease, interval, reps, lapses, due = computeScheduling(card, rating, now, min_interval_days)
+        local delta = due - now
+        result[rating] = {
+            ease = ease,
+            interval = interval,
+            reps = reps,
+            lapses = lapses,
+            due = due,
+            label = formatDelta(delta),
+        }
+    end
+    return result
+end
+
+function DB.updateCardScheduling(card, rating, now_ts, min_interval_days)
+    if not card or not card.id then
+        return nil
+    end
+    DB.init()
+    local now = now_ts or os.time()
+    local new_ease, new_interval, new_reps, new_lapses, new_due = computeScheduling(card, rating, now, min_interval_days)
+    withConnection(function(conn)
+        local stmt = conn:prepare([[UPDATE cards
+            SET ease = ?, interval = ?, due = ?, reps = ?, lapses = ?, updated_at = ?
+            WHERE id = ?;]])
+        stmt:bind(new_ease, new_interval, new_due, new_reps, new_lapses, now, card.id)
+        stmt:step()
+        stmt:close()
+    end)
+    return {
+        id = card.id,
+        deck_id = card.deck_id,
+        front = card.front,
+        back = card.back,
+        ease = new_ease,
+        interval = new_interval,
+        due = new_due,
+        reps = new_reps,
+        lapses = new_lapses,
+    }
+end
+
+return DB
